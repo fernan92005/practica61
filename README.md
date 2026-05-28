@@ -125,8 +125,6 @@ The workflow in `.github/workflows/ci.yml` triggers on every **push** and **pull
 
 ## Badges
 
-## Badges
-
 ![Estado del Workflow](https://github.com/fernan92005/practica61/actions/workflows/ci.yml/badge.svg)
 ![Coverage](.github/badges/jacoco.svg)
 ![Branches](.github/badges/branches.svg)
