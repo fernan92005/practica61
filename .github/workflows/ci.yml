@@ -50,12 +50,13 @@ jobs:
 
 # 1. Informe de resultados con dorny (lee los XML de Surefire y Failsafe)
       - name: Publish Test Report
-        uses: dorny/test-reporter@v1
+        uses: dorny/test-reporter@v2
         if: always()
         with:
           name: Resultados de Pruebas
           path: '**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml'
           reporter: java-junit
+          fail-on-error: false
 
       # 2. Artefactos prometidos en el README
       - name: Uploads XML reports as a downloadable artifact
