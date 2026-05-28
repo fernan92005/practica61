@@ -2,6 +2,10 @@ name: Practica 6
 
 on: [push, pull_request]
 
+permissions:
+  contents: write
+  checks: write
+
 jobs: 
   build:
     runs-on: ubuntu-latest
@@ -44,17 +48,40 @@ jobs:
       - name: Ejecutar tests
         run: ./mvnw verify --no-transfer-progress
 
+# 1. Informe de resultados con dorny (lee los XML de Surefire y Failsafe)
       - name: Publish Test Report
-        uses: ctrf-io/github-test-reporter@v1
-        with:
-          report-path: './ctrf/*.json'
-          github-report: true
+        uses: dorny/test-reporter@v1
         if: always()
+        with:
+          name: Resultados de Pruebas
+          path: '**/target/surefire-reports/*.xml,**/target/failsafe-reports/*.xml'
+          reporter: java-junit
 
-      - name: Build with Maven
-        run: mvn -B test
+      # 2. Artefactos prometidos en el README
+      - name: Uploads XML reports as a downloadable artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports-xml
+          path: |
+            **/target/surefire-reports/*.xml
+            **/target/failsafe-reports/*.xml
+          retention-days: 7
 
+      # 3. Generar Badge de Jacoco (asegúrate de que el plugin jacoco-maven-plugin está en tu pom.xml)
       - name: Generate JaCoCo Badge
+        id: jacoco
         uses: cicirello/jacoco-badge-generator@v2
         with:
           generate-branches-badge: true
+          jacoco-csv-file: target/site/jacoco/jacoco.csv
+
+      # 4. Hacer commit y push del badge autogenerado de Jacoco
+      - name: Commit y Push del Badge de Cobertura
+        if: github.event_name == 'push'
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/badges/
+          git commit -m "Actualizar badge de cobertura Jacoco" || echo "No hay cambios en la cobertura"
+          git push
