@@ -121,3 +121,9 @@ The workflow in `.github/workflows/ci.yml` triggers on every **push** and **pull
 - JUnit 5 · MockMvc · WebTestClient
 - SpringDoc OpenAPI (Swagger UI)
 - Maven · GitHub Actions
+
+
+## Badges
+
+![Coverage](.github/badges/jacoco.svg)
+![Branches](.github/badges/branches.svg)
