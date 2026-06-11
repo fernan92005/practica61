@@ -1566,32 +1566,142 @@ Ambas tienen `source_ranges = ["0.0.0.0/0"]`, lo que significa que cualquier IP 
 - **HTTP** sí debe ser accesible desde cualquier IP (es tráfico de usuarios).
 
 El uso de `target_tags` garantiza que la regla solo aplique a las VMs correctas (con el tag `web` o `ssh-enabled`), no a toda la red.
-Hub Actions, por ejemplo):
-export TF_VAR_db_password="${{ secrets.DB_PASSWORD }}"
-terraform apply -auto-approve
+
+---
+
+## 21. GCP — Autenticación, APIs y operativa completa
+
+> Contenido del manual de clase. Cubre lo que necesitas antes de ejecutar `terraform init` en un proyecto GCP.
+
+### Autenticación con gcloud CLI
+
+Hay tres comandos distintos y es crucial entender para qué sirve cada uno:
+
+```bash
+# 1. Autentica TU USUARIO para usar el CLI de gcloud
+#    (listar proyectos, gestionar recursos desde terminal, etc.)
+gcloud auth login
+
+# 2. Fija el proyecto por defecto para no especificarlo en cada comando
+gcloud config set project PROJECT_ID
+
+# 3. Genera credenciales separadas que herramientas de TERCEROS (Terraform, SDKs)
+#    encuentran y usan automáticamente — Application Default Credentials (ADC)
+gcloud auth application-default login
 ```
 
-El valor nunca aparece en los logs (Terraform lo enmascara con `sensitive = true`) ni en el código fuente.
+**Por qué el tercer comando es obligatorio para Terraform:** aunque `gcloud auth login` funcione, Terraform no usa esas credenciales. Terraform busca las "Application Default Credentials" — un fichero JSON generado por `application-default login`. Sin este paso, `terraform apply` fallará con error de autenticación aunque el CLI de gcloud funcione perfectamente.
 
-#### Supuesto 5: `prevent_destroy` vs `ignore_changes` — ¿cuándo usar cada uno?
+> **⚠️ Nunca hardcodear credenciales en el código ni subirlas a un repositorio.**
 
-| Meta-argumento | Qué hace | Cuándo usarlo |
-|---|---|---|
-| `prevent_destroy = true` | Impide que `terraform destroy` o un plan de sustitución elimine el recurso | Bases de datos de producción, buckets con datos críticos |
-| `ignore_changes = [atributo]` | Ignora cambios en ese atributo concreto (Terraform no los detecta ni intenta revertirlos) | Cuando un sistema externo modifica el atributo (ej: autoescalado que cambia el número de instancias) |
+### Variables de entorno alternativas
+
+Como alternativa a los comandos de autenticación, se pueden usar variables de entorno. Terraform las detecta automáticamente:
+
+```bash
+export GOOGLE_PROJECT="mi-proyecto-id"
+export GOOGLE_REGION="europe-west1"
+```
+
+Útil en pipelines CI/CD donde no se puede ejecutar `gcloud auth login` interactivo.
+
+---
+
+### Conceptos clave de GCP para Terraform
+
+| Concepto | Descripción |
+|---|---|
+| **Project** | Unidad de aislamiento en GCP. Todo recurso pertenece a un proyecto. Es el equivalente a una "cuenta" o "tenant". |
+| **Region / Zone** | Las regiones agrupan zonas geográficas. Los recursos pueden ser regionales (subnets) o zonales (VMs). Formato zona: `region-[a/b/c]`, ej: `europe-west1-b` |
+| **APIs** | Cada servicio de GCP tiene una API que hay que habilitar antes de usarlo. Por defecto están desactivadas. |
+| **Service Account** | Identidad para aplicaciones y automatización. En CI/CD se usa una Service Account (fichero JSON con clave) en lugar de ADC personal. |
+
+---
+
+### Habilitar APIs de GCP
+
+Cada servicio de GCP tiene una API asociada que hay que activar antes de crear recursos de ese tipo. Si intentas crear una VM sin habilitar la API de Compute Engine, `terraform apply` fallará con un error de permisos.
+
+**Opción A — CLI (recomendada para empezar):**
+```bash
+gcloud services enable compute.googleapis.com
+```
+
+**Opción B — Desde Terraform con `google_project_service`:**
+```hcl
+resource "google_project_service" "compute" {
+  service            = "compute.googleapis.com"
+  disable_on_destroy = false   # No deshabilitar la API al hacer destroy
+}
+```
+
+**Problema importante con la Opción B:** Terraform crea recursos en paralelo por defecto. Si `google_project_service` está en el mismo fichero que el resto de recursos, las VMs intentarán crearse antes de que la API esté habilitada y fallarán. Solución: añadir `depends_on` a cada recurso que necesite la API:
 
 ```hcl
-resource "aws_autoscaling_group" "app" {
+resource "google_compute_instance" "vm" {
   # ...
-  lifecycle {
-    ignore_changes = [desired_capacity]   # El autoescalador de AWS cambia este valor; Terraform no debe revertirlo
-  }
+  depends_on = [google_project_service.compute]
 }
+```
 
-resource "aws_db_instance" "produccion" {
-  # ...
-  lifecycle {
-    prevent_destroy = true   # Nunca borrar accidentalmente la BBDD de producción
+Esto complica el código innecesariamente, por eso **en clase se usa la Opción A** (habilitar manualmente antes de ejecutar Terraform).
+
+**Por qué `disable_on_destroy = false`:** si se habilita la API desde Terraform y luego se hace `destroy`, Terraform intentaría deshabilitarla — lo que podría romper otros recursos del proyecto que también dependan de ella. Con `false`, el destroy no la desactiva.
+
+---
+
+### Errores comunes en GCP y cómo resolverlos
+
+| Error | Causa | Solución |
+|---|---|---|
+| `API not enabled` | La API del servicio no está activa en el proyecto | Habilitarla con `gcloud services enable <api>` o `google_project_service` |
+| `Quota exceeded` | Se superó el límite de recursos gratuitos (ej: más de 1 VM e2-micro en el Free Tier) | Usar tipos de instancia pequeños (`e2-micro`, `e2-small`) o destruir recursos anteriores |
+| `Zone does not exist` | La zona especificada no existe en esa región | Usar formato correcto: `region-[a/b/c]`, ej: `europe-west1-b` |
+| `Permission denied` | Las credenciales no tienen los permisos IAM necesarios | Revisar roles IAM del usuario o service account |
+| `Recursos huérfanos` | Se destruyó el estado (`terraform.tfstate`) pero no los recursos reales en GCP | Usar `terraform import` para volver a gestionar el recurso, o borrarlo manualmente en la consola |
+| `exit status 127` en startup script | Saltos de línea CRLF (Windows) corrompen el shebang `#!/bin/bash` | Usar `replace(<<-EOF ... EOF, "\r", "")` en el script — ya visto en la práctica |
+
+---
+
+### Backend remoto con GCS
+
+Por defecto Terraform guarda el estado en `terraform.tfstate` local. En equipo esto es un problema: si dos personas tienen cada una su propio fichero, Terraform no sabe qué recursos existen realmente y puede provocar duplicados o destrucciones accidentales.
+
+La solución en GCP es usar un bucket de Cloud Storage como backend remoto:
+
+```hcl
+terraform {
+  backend "gcs" {
+    bucket = "mi-bucket-tfstate"
+    prefix = "terraform/state"
   }
 }
 ```
+
+**⚠️ El bucket debe existir ANTES de ejecutar `terraform init`.** No se puede gestionar con el mismo Terraform que lo va a usar (el estado del estado no puede estar en sí mismo). Créalo manualmente:
+
+```bash
+gcloud storage buckets create gs://mi-bucket-tfstate --location=europe-west1
+```
+
+**Ventajas sobre el backend local:**
+
+| Aspecto | Local | GCS |
+|---|---|---|
+| Bloqueo | ❌ (conflictos en equipo) | ✅ automático (GCS) |
+| Compartido | ❌ (solo quien tiene el fichero) | ✅ todos acceden al mismo estado |
+| Versionado | ❌ | ✅ (GCS versioning) |
+| Cifrado | ❌ (texto plano) | ✅ (cifrado en reposo automático) |
+
+GCS proporciona **bloqueo de estado automático** sin necesitar DynamoDB (a diferencia de S3, que requiere una tabla DynamoDB separada para el bloqueo).
+
+---
+
+### Buenas prácticas específicas de GCP
+
+- Usar siempre variables para `project_id` y `region`, **nunca hardcodeados** en el HCL.
+- Añadir **tags** a los recursos para facilitar la gestión de costes y permisos.
+- Usar **`e2-micro` o `e2-small`** durante el desarrollo para no consumir cuota (son los tipos elegibles para el Free Tier de GCP).
+- Ejecutar siempre `terraform plan` antes de `apply` y leer el output con atención.
+- **Hacer `terraform destroy` al terminar las prácticas** para no gastar créditos de GCP. Los recursos en cloud generan coste aunque no se usen.
+- Configurar un backend remoto (GCS bucket) en proyectos reales para compartir el estado con el equipo.
