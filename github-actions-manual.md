@@ -246,9 +246,11 @@ docker-push:
 build:
   runs-on: ubuntu-latest
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código
+      uses: actions/checkout@v4
 
-    - uses: actions/setup-java@v4
+    - name: Configurar JDK 21
+      uses: actions/setup-java@v4
       with:
         distribution: temurin      # También: 'corretto', 'zulu'
         java-version: '21'
@@ -265,7 +267,8 @@ build:
       run: ./mvnw -B clean package --file pom.xml
 
     # Opcional: subir JAR como artefacto
-    - uses: actions/upload-artifact@v4
+    - name: Subir JAR como artefacto
+      uses: actions/upload-artifact@v4
       with:
         name: app-jar
         path: target/*.jar
@@ -286,9 +289,11 @@ build:
 build:
   runs-on: ubuntu-latest
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código
+      uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
+    - name: Configurar Python 3.12
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
         cache: 'pip'               # Cachea ~/.cache/pip
@@ -315,21 +320,25 @@ test:
   needs: build
   runs-on: ubuntu-latest
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código
+      uses: actions/checkout@v4
 
-    - uses: actions/setup-java@v4
+    - name: Configurar JDK 21
+      uses: actions/setup-java@v4
       with:
         distribution: temurin
         java-version: '21'
         cache: maven
 
-    - run: chmod +x ./mvnw
+    - name: Dar permisos al wrapper
+      run: chmod +x ./mvnw
 
     - name: Ejecutar tests (unitarios + integración)
       run: ./mvnw verify --no-transfer-progress
 
     # Informe visual en la pestaña Checks de GitHub
-    - uses: dorny/test-reporter@v2      # ← SIEMPRE v2, v1 falla con Node.js 24
+    - name: Publicar informe de tests en GitHub
+      uses: dorny/test-reporter@v2      # ← SIEMPRE v2, v1 falla con Node.js 24
       if: always()                      # Ejecutar aunque los tests fallen
       with:
         name: Resultados de Pruebas
@@ -338,7 +347,8 @@ test:
         fail-on-error: false
 
     # Guardar XML como artefacto descargable
-    - uses: actions/upload-artifact@v4
+    - name: Subir XMLs de tests como artefacto
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: test-reports-xml
@@ -357,19 +367,23 @@ test:
   needs: build
   runs-on: ubuntu-latest
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código
+      uses: actions/checkout@v4
 
-    - uses: actions/setup-python@v5
+    - name: Configurar Python 3.12
+      uses: actions/setup-python@v5
       with:
         python-version: '3.12'
         cache: 'pip'
 
-    - run: pip install -r requirements.txt
+    - name: Instalar dependencias
+      run: pip install -r requirements.txt
 
     - name: Tests con pytest
       run: pytest tests/ --junitxml=test-results.xml
 
-    - uses: actions/upload-artifact@v4
+    - name: Subir resultados como artefacto
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: test-results
@@ -381,7 +395,7 @@ test:
 
 ## 8. DOCKER
 
-### Login + Build + Push a Docker Hub
+### Login + Build + Push a Docker Hub (básico)
 
 ```yaml
 docker-build-and-push:
@@ -389,7 +403,8 @@ docker-build-and-push:
   runs-on: ubuntu-latest
   if: github.event_name == 'push'    # Solo en push, no en PRs
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código
+      uses: actions/checkout@v4
 
     - name: Login a Docker Hub
       uses: docker/login-action@v3
@@ -421,6 +436,74 @@ docker-build-and-push:
 GitHub → repo → Settings → Secrets and variables → Actions → New repository secret
   DOCKERHUB_USERNAME  = tu usuario de Docker Hub
   DOCKERHUB_TOKEN     = token de hub.docker.com con permisos Read & Write
+```
+
+### Login + Build + Push con QEMU + metadatos (multi-plataforma)
+
+Versión completa con soporte para **múltiples arquitecturas** (amd64 + arm64) y **tags automáticos** generados a partir de los metadatos del commit.
+
+```yaml
+build-and-push:
+  needs: test
+  runs-on: ubuntu-latest
+  steps:
+    - name: Descargar el código
+      uses: actions/checkout@v4
+
+    - name: Configurar Docker QEMU
+      uses: docker/setup-qemu-action@v3
+      # QEMU emula otras arquitecturas (arm64, etc.) en la máquina x86 del runner
+      # Sin esto solo puedes compilar para linux/amd64
+
+    - name: Configurar Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      # Buildx es necesario para builds multi-plataforma
+
+    - name: Login en Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Extraer metadatos
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ secrets.DOCKERHUB_USERNAME }}/nombre-imagen
+        tags: |
+          type=raw,value=latest          # Tag fijo :latest
+          type=sha                       # Tag con el SHA corto del commit (ej: sha-abc1234)
+      # El step genera ${{ steps.meta.outputs.tags }} y ${{ steps.meta.outputs.labels }}
+
+    - name: Build and Push
+      uses: docker/build-push-action@v6
+      with:
+        context: .
+        push: true
+        platforms: linux/amd64,linux/arm64   # Build para ambas arquitecturas
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+```
+
+**Diferencias respecto al básico:**
+
+| | Básico | Con QEMU + metadata-action |
+|---|---|---|
+| Arquitecturas | Solo `linux/amd64` | `linux/amd64` + `linux/arm64` (y más) |
+| Tags | Manuales en el YAML | Generados automáticamente por `metadata-action` |
+| Trazabilidad | `github.sha` completo | SHA corto (`sha-abc1234`) |
+| Compatibilidad | Servidores x86 | Servidores x86 + Macs Apple Silicon + Raspberry Pi |
+
+**Tipos de tag disponibles en `metadata-action`:**
+
+```yaml
+tags: |
+  type=raw,value=latest          # Tag fijo con valor literal
+  type=sha                       # SHA corto del commit
+  type=ref,event=branch          # Nombre de la rama (ej: main)
+  type=ref,event=pr              # Número de PR (ej: pr-42)
+  type=semver,pattern={{version}}# Versión de la release (ej: 1.2.3)
+  type=semver,pattern={{major}}  # Solo major (ej: 1)
 ```
 
 ### Dockerfile multi-stage
@@ -456,7 +539,8 @@ deploy-to-kubernetes:
   needs: docker-build-and-push
   runs-on: self-hosted       # Tu máquina donde está kubectl configurado
   steps:
-    - uses: actions/checkout@v4
+    - name: Descargar el código (para acceder a los manifiestos k8s/)
+      uses: actions/checkout@v4
 
     - name: Crear namespace si no existe (idempotente)
       run: kubectl create namespace ips --dry-run=client -o yaml | kubectl apply -f -
@@ -490,7 +574,8 @@ sudo ./svc.sh start
 
 ```yaml
 # Subir (en el job que genera el fichero)
-- uses: actions/upload-artifact@v4
+- name: Subir artefacto
+  uses: actions/upload-artifact@v4
   with:
     name: mi-artefacto        # Nombre único en el workflow
     path: target/*.jar
@@ -498,7 +583,8 @@ sudo ./svc.sh start
     if-no-files-found: error  # error | warn | ignore
 
 # Descargar (en otro job que lo necesita)
-- uses: actions/download-artifact@v4
+- name: Descargar artefacto
+  uses: actions/download-artifact@v4
   with:
     name: mi-artefacto
     path: ./descargado/
@@ -620,7 +706,7 @@ Genera `target/site/jacoco/jacoco.csv` al ejecutar `./mvnw verify`.
 **Paso 2 — Steps en el workflow (dentro del job de test):**
 
 ```yaml
-- name: Generar badge de cobertura
+- name: Generar badge de cobertura Jacoco
   id: jacoco
   uses: cicirello/jacoco-badge-generator@v2
   with:
