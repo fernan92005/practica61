@@ -1186,3 +1186,412 @@ Leer el `terraform plan` completo antes de ejecutar `apply`. La línea resumen a
 - Principio de mínimo privilegio: los providers de cloud deben usar credenciales con solo los permisos necesarios.
 - Usar `lifecycle { prevent_destroy = true }` en recursos críticos como bases de datos de producción.
 - Revisar cuidadosamente cualquier plan que muestre recursos a destruir.
+
+---
+
+## 20. Providers Cloud — Teoría y supuestos prácticos
+
+> Esta sección cubre los providers cloud **tal y como se trabajaron en clase y en la práctica de la asignatura**, usando GCP como proveedor real. Incluye los patrones que pueden aparecer en el examen como supuestos teórico-prácticos.
+
+### El stack de la práctica: Google Cloud Platform (GCP)
+
+En la asignatura se usó GCP con el proyecto `claseterra` y el provider `hashicorp/google ~> 5.0`. El flujo completo fue:
+
+```
+VPC (red privada) → Subnet → Firewall rules → VM(s) con nginx
+```
+
+#### Configuración del provider (versions.tf)
+
+```hcl
+terraform {
+  required_version = ">= 1.5"
+
+  required_providers {
+    google = {
+      source  = "hashicorp/google"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "google" {
+  project = var.project_id   # Nunca hardcodear — viene de variable
+  region  = var.region
+}
+```
+
+Las credenciales se pasan mediante `gcloud auth application-default login` o la variable de entorno `GOOGLE_APPLICATION_CREDENTIALS`. **Nunca se escriben en el HCL.**
+
+---
+
+### Fase 1 — Infraestructura básica (clase)
+
+#### Red: VPC + Subnet
+
+```hcl
+# Red privada (VPC) — sin subredes automáticas
+resource "google_compute_network" "vpc" {
+  name                    = "mi-vpc"
+  auto_create_subnetworks = false   # Gestión manual de subredes
+}
+
+# Subred dentro de la VPC
+resource "google_compute_subnetwork" "subnet" {
+  name          = "mi-subnet"
+  ip_cidr_range = "10.0.1.0/24"    # Rango de IPs privadas
+  region        = var.region
+  network       = google_compute_network.vpc.id   # Referencia a la VPC de arriba
+}
+```
+
+**Por qué `auto_create_subnetworks = false`:** en modo automático, GCP crea una subnet por región. En proyectos reales se prefiere control manual para definir CIDRs propios y evitar solapamientos.
+
+**Por qué `network = google_compute_network.vpc.id`:** la subnet debe existir dentro de la VPC. Esta referencia crea una dependencia implícita — Terraform crea primero la VPC y después la subnet, sin necesitar `depends_on`.
+
+#### Reglas de firewall
+
+```hcl
+# Permitir SSH (puerto 22) desde cualquier IP
+resource "google_compute_firewall" "allow_ssh" {
+  name    = "allow-ssh"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["22"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]      # Cualquier origen (en prod: restringir a IPs conocidas)
+  target_tags   = ["ssh-enabled"]    # Solo aplica a VMs con este tag
+}
+
+# Permitir HTTP/HTTPS (puertos 80 y 443) desde cualquier IP
+resource "google_compute_firewall" "allow_http" {
+  name    = "allow-http"
+  network = google_compute_network.vpc.name
+
+  allow {
+    protocol = "tcp"
+    ports    = ["80", "443"]
+  }
+
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web"]            # Solo aplica a VMs con este tag
+}
+```
+
+**Por qué `target_tags`:** las reglas de firewall en GCP se aplican por tags de red, no a toda la VPC. Una VM sin el tag `web` no recibirá tráfico HTTP aunque esté en la misma red. Esto permite segmentación fina: servidores web reciben HTTP, servidores de base de datos no.
+
+#### VM con nginx via startup script
+
+```hcl
+resource "google_compute_instance" "vm" {
+  name         = "mi-servidor"
+  machine_type = "e2-micro"          # Tipo de instancia (2 vCPU, 1 GB RAM)
+  zone         = "${var.region}-b"   # Zona = región + sufijo (europe-west1-b)
+
+  tags = ["ssh-enabled", "web"]      # Activan las reglas de firewall correspondientes
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"   # Imagen del SO
+    }
+  }
+
+  network_interface {
+    subnetwork = google_compute_subnetwork.subnet.id
+
+    access_config {
+      # Bloque vacío = asignar IP pública efímera automáticamente
+    }
+  }
+
+  metadata_startup_script = replace(<<-EOF
+#!/bin/bash
+apt-get update
+apt-get install -y nginx
+systemctl enable nginx
+systemctl start nginx
+EOF
+  , "\r", "")
+}
+```
+
+**Por qué `replace(..., "\r", "")`:** en Windows, los ficheros `.tf` pueden tener saltos de línea `\r\n` (CRLF). El startup script en Linux solo entiende `\n` (LF). El `replace` elimina los `\r` para evitar errores de ejecución en la VM.
+
+**Por qué `access_config {}`:** en GCP, si no hay bloque `access_config`, la VM solo tiene IP privada (sin acceso desde Internet). El bloque vacío le asigna una IP pública efímera.
+
+**Output — IP pública de la VM:**
+
+```hcl
+output "ip_publica" {
+  value = google_compute_instance.vm.network_interface[0].access_config[0].nat_ip
+}
+```
+
+`network_interface[0]`: primera interfaz de red. `access_config[0]`: primera configuración de acceso externo. `nat_ip`: la IP pública asignada.
+
+---
+
+### Fase 2 — Múltiples VMs con módulo (práctica)
+
+El siguiente paso fue crear **3 VMs idénticas** reutilizando un módulo. Esto ilustra dos conceptos clave: modularización y `for_each`.
+
+#### Estructura del proyecto
+
+```
+practica/cloud/
+├── main.tf           # Root: red, firewalls, llamada al módulo
+├── variables.tf
+├── outputs.tf
+├── terraform.tfvars
+└── modules/
+    └── vm/
+        ├── main.tf       # Define google_compute_instance
+        ├── variables.tf  # Parámetros del módulo
+        └── outputs.tf    # ip_publica, url_nginx
+```
+
+#### Módulo vm — definición
+
+**modules/vm/variables.tf:**
+```hcl
+variable "name"          { type = string }
+variable "machine_type"  { type = string; default = "e2-micro" }
+variable "zone"          { type = string }
+variable "subnetwork_id" { type = string }
+```
+
+**modules/vm/main.tf:**
+```hcl
+resource "google_compute_instance" "this" {
+  name         = var.name
+  machine_type = var.machine_type
+  zone         = var.zone
+
+  tags = ["ssh-enabled", "web"]
+
+  boot_disk {
+    initialize_params {
+      image = "debian-cloud/debian-12"
+    }
+  }
+
+  network_interface {
+    subnetwork = var.subnetwork_id
+    access_config {}
+  }
+
+  # El startup script instala nginx y personaliza la página de inicio con el nombre de la VM
+  metadata_startup_script = replace(<<-EOF
+#!/bin/bash
+apt-get update -y
+apt-get install -y nginx
+systemctl enable nginx
+systemctl start nginx
+echo "<h1>${var.name}</h1>" > /var/www/html/index.html
+EOF
+  , "\r", "")
+}
+```
+
+**modules/vm/outputs.tf:**
+```hcl
+output "ip_publica" {
+  value = google_compute_instance.this.network_interface[0].access_config[0].nat_ip
+}
+
+output "url_nginx" {
+  value = "http://${google_compute_instance.this.network_interface[0].access_config[0].nat_ip}"
+}
+```
+
+#### Root module — instanciar 3 VMs con `for_each`
+
+**main.tf (raíz):**
+```hcl
+variable "vm_names" {
+  type    = list(string)
+  default = ["vm-1", "vm-2", "vm-3"]
+}
+
+# Red + subnet + firewalls (igual que Fase 1, con nombre "practica-vpc")
+resource "google_compute_network" "vpc" {
+  name                    = "practica-vpc"
+  auto_create_subnetworks = false
+}
+
+resource "google_compute_subnetwork" "subnet" {
+  name          = "practica-subnet"
+  ip_cidr_range = "10.0.1.0/24"
+  region        = var.region
+  network       = google_compute_network.vpc.id
+}
+
+resource "google_compute_firewall" "allow_ssh" {
+  name    = "allow-ssh"
+  network = google_compute_network.vpc.name
+  allow { protocol = "tcp"; ports = ["22"] }
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["ssh-enabled"]
+}
+
+resource "google_compute_firewall" "allow_http" {
+  name    = "allow-http"
+  network = google_compute_network.vpc.name
+  allow { protocol = "tcp"; ports = ["80"] }
+  source_ranges = ["0.0.0.0/0"]
+  target_tags   = ["web"]
+}
+
+# Instanciar el módulo vm una vez por cada nombre en vm_names
+module "vms" {
+  for_each = toset(var.vm_names)   # Convierte la lista en set para for_each
+
+  source        = "./modules/vm"
+  name          = each.key          # "vm-1", "vm-2", "vm-3"
+  machine_type  = var.machine_type
+  zone          = var.zone
+  subnetwork_id = google_compute_subnetwork.subnet.id
+}
+```
+
+**outputs.tf (raíz):**
+```hcl
+# Expresión for: construye un mapa { nombre → ip } para todas las VMs
+output "ips_publicas" {
+  description = "IPs públicas de todas las VMs"
+  value = {
+    for name, vm in module.vms : name => vm.ip_publica
+  }
+}
+
+output "urls_nginx" {
+  description = "URLs de Nginx en todas las VMs"
+  value = {
+    for name, vm in module.vms : name => "http://${vm.ip_publica}"
+  }
+}
+```
+
+**Resultado de `terraform output`:**
+```
+ips_publicas = {
+  "vm-1" = "34.78.80.62"
+  "vm-2" = "34.78.2.101"
+  "vm-3" = "34.22.177.107"
+}
+urls_nginx = {
+  "vm-1" = "http://34.78.80.62"
+  "vm-2" = "http://34.78.2.101"
+  "vm-3" = "http://34.22.177.107"
+}
+```
+
+**Por qué `toset(var.vm_names)`:** `for_each` requiere un `set` o un `map`, no una `list`. `toset()` convierte la lista en un conjunto de valores únicos que se usan como claves.
+
+**Por qué `for_each` en lugar de `count` aquí:** con `count`, las VMs se identifican por índice (0, 1, 2). Si se elimina "vm-2" de la lista, Terraform destruye y recrea "vm-2" y "vm-3". Con `for_each`, cada VM se identifica por su nombre — eliminar "vm-2" solo destruye esa VM.
+
+---
+
+### Supuestos tipo examen — Práctica Cloud
+
+#### Supuesto 1: ¿Qué recursos son necesarios para que una VM en GCP sea accesible por HTTP desde Internet?
+
+**Respuesta:** cuatro recursos y un tag:
+1. `google_compute_network` — la VPC donde vive la VM.
+2. `google_compute_subnetwork` — la subred con el rango de IPs privadas.
+3. `google_compute_firewall` con `ports = ["80"]` y `target_tags = ["web"]` — abre el puerto 80.
+4. `google_compute_instance` con `tags = ["web"]` y `access_config {}` en el `network_interface` — tag activa el firewall, `access_config` asigna IP pública.
+
+Sin `access_config {}`, la VM no tiene IP pública. Sin el tag `web`, el firewall no aplica. Ambos son necesarios.
+
+#### Supuesto 2: Explica el uso de `metadata_startup_script` en la VM
+
+El `metadata_startup_script` es un script bash que GCP ejecuta automáticamente al arrancar la VM por primera vez. Permite instalar software (nginx, Docker, etc.) sin conectarse manualmente por SSH. En la práctica:
+
+```hcl
+metadata_startup_script = replace(<<-EOF
+#!/bin/bash
+apt-get update -y
+apt-get install -y nginx
+systemctl enable nginx
+systemctl start nginx
+echo "<h1>${var.name}</h1>" > /var/www/html/index.html
+EOF
+, "\r", "")
+```
+
+El `replace(..., "\r", "")` es necesario cuando el fichero `.tf` se edita en Windows (CRLF) para que el script sea válido en Linux (LF). `${var.name}` es interpolación de variables HCL dentro del heredoc.
+
+#### Supuesto 3: ¿Cómo se obtiene la IP pública de una VM en Terraform para GCP?
+
+```hcl
+output "ip" {
+  value = google_compute_instance.vm.network_interface[0].access_config[0].nat_ip
+}
+```
+
+La VM puede tener múltiples interfaces de red (`[0]` = la primera). Cada interfaz puede tener múltiples configuraciones de acceso externo (`[0]` = la primera). `nat_ip` es la IP pública asignada (NAT porque GCP hace NAT entre la IP pública y la privada interna).
+
+#### Supuesto 4: ¿Cómo se crean N VMs idénticas con for_each y un módulo?
+
+```hcl
+variable "vm_names" {
+  type    = list(string)
+  default = ["vm-1", "vm-2", "vm-3"]
+}
+
+module "vms" {
+  for_each = toset(var.vm_names)
+  source   = "./modules/vm"
+  name     = each.key
+  # ... otros parámetros
+}
+```
+
+`for_each = toset(var.vm_names)` itera sobre cada nombre. `each.key` toma el valor de cada iteración. Terraform crea recursos nombrados `module.vms["vm-1"]`, `module.vms["vm-2"]`, etc. Para acceder a los outputs de todas las VMs en el root:
+
+```hcl
+output "todas_las_ips" {
+  value = { for name, vm in module.vms : name => vm.ip_publica }
+}
+```
+
+#### Supuesto 5: ¿Cuál es la diferencia entre las reglas de firewall `allow_ssh` y `allow_http` en cuanto a seguridad?
+
+Ambas tienen `source_ranges = ["0.0.0.0/0"]`, lo que significa que cualquier IP puede conectarse. En producción:
+- **SSH** debería restringirse a IPs conocidas (oficina, VPN): `source_ranges = ["203.0.113.0/24"]`.
+- **HTTP** sí debe ser accesible desde cualquier IP (es tráfico de usuarios).
+
+El uso de `target_tags` garantiza que la regla solo aplique a las VMs correctas (con el tag `web` o `ssh-enabled`), no a toda la red.
+Hub Actions, por ejemplo):
+export TF_VAR_db_password="${{ secrets.DB_PASSWORD }}"
+terraform apply -auto-approve
+```
+
+El valor nunca aparece en los logs (Terraform lo enmascara con `sensitive = true`) ni en el código fuente.
+
+#### Supuesto 5: `prevent_destroy` vs `ignore_changes` — ¿cuándo usar cada uno?
+
+| Meta-argumento | Qué hace | Cuándo usarlo |
+|---|---|---|
+| `prevent_destroy = true` | Impide que `terraform destroy` o un plan de sustitución elimine el recurso | Bases de datos de producción, buckets con datos críticos |
+| `ignore_changes = [atributo]` | Ignora cambios en ese atributo concreto (Terraform no los detecta ni intenta revertirlos) | Cuando un sistema externo modifica el atributo (ej: autoescalado que cambia el número de instancias) |
+
+```hcl
+resource "aws_autoscaling_group" "app" {
+  # ...
+  lifecycle {
+    ignore_changes = [desired_capacity]   # El autoescalador de AWS cambia este valor; Terraform no debe revertirlo
+  }
+}
+
+resource "aws_db_instance" "produccion" {
+  # ...
+  lifecycle {
+    prevent_destroy = true   # Nunca borrar accidentalmente la BBDD de producción
+  }
+}
+```
